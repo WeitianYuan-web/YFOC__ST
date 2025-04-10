@@ -149,6 +149,9 @@ uint8_t as5600_dma_buffer[2]; // 用于接收编码器数据的DMA缓冲区
 uint8_t as5600_reg_addr = AS5600_ANGLE_REG; // 角度寄存器地址
 volatile uint8_t as5600_dma_complete = 0; // DMA完成标志
 
+//foc_runing
+
+
 // 用于存储角度和速度的变量
 float position_rad = 0.0f; // 当前位置（弧度）
 float velocity_rad_per_sec = 0.0f; // 当前速度（弧度/秒）
@@ -162,6 +165,7 @@ typedef struct {
     int32_t vel_full_rotations;    // 速度计算用的圈数
     uint16_t raw_angle;            // 当前原始角度值(0-4095)
     int32_t total_angle_raw;       // 总共旋转的角度-一圈是4096
+    float rotor_zero_elec_angle;        // 零电角度
     uint16_t angle_prev;           // 上一次角度值(0-4095)
     uint32_t angle_prev_ts;        // 上一次角度时间戳
     float position_rad;            // 当前位置（弧度）
@@ -228,7 +232,7 @@ float _normalizeAngle(float angle)
 // Electrical angle calculation
 float _electricalAngle(float shaft_angle, int pole_pairs)
 {
-    return (shaft_angle * pole_pairs);
+    return (shaft_angle * (float)pole_pairs) - as5600.rotor_zero_elec_angle;
 }
 
 // square root approximation function using
@@ -312,7 +316,7 @@ float velocityOpenloop(float target_velocity) {
   float abs_speed = fabsf(target_velocity);
 
   // 更新角度
-  angle_open = _normalizeAngle(angle_open + target_velocity * Ts);
+  angle_open = _normalizeAngle(angle_open - target_velocity * Ts);
 
   float Uq = voltage_power_supply/3;
 
@@ -322,6 +326,9 @@ float velocityOpenloop(float target_velocity) {
   return Uq;
 }
 
+void position_control(float rad)
+{
+}
 
 uint16_t AS5600_GetRawAngle(AS5600_TypeDef *as5600)
 {
@@ -387,7 +394,7 @@ void AS5600_ProcessData(AS5600_TypeDef *as5600) {
     uint16_t raw_angle = ((uint16_t)as5600_dma_buffer[0] << 8) | as5600_dma_buffer[1];
     raw_angle &= 0x0FFF; // 保留12位数据
     
-    as5600->raw_angle = raw_angle;
+    as5600->raw_angle = raw_angle ;
     
     // 检测圈数变化
     int16_t angle_diff = (int16_t)raw_angle - (int16_t)as5600->angle_prev;
@@ -490,7 +497,13 @@ int main(void)
     /* 使能输出 */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
 
-
+    set_pwm_duty(0.5, 0, 0);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
+    HAL_Delay(400);                       // 保持一会，转子吸引过来需要时间
+    as5600.rotor_zero_elec_angle = _electricalAngle(as5600.position_rad, POLE_PAIRS) ;
+    set_pwm_duty(0, 0, 0);                // 松开电机
+    HAL_Delay(10);
+    // 启动定时器
+    HAL_TIM_Base_Start_IT(&htim3);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -501,14 +514,13 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
    
-      velocityOpenloop(20.0f);
 
-      /* 可以在此处添加一些非实时处理代码，比如UART发送数据 */
+      /*// 可以在此处添加一些非实时处理代码，比如UART发送数据
       sprintf(uart_buffer, "角度encode:%d total_encode:%ld 总rad:%.2f rad 速度:%.2f rad/s %.2f RPM\r\n",
               as5600.raw_angle,as5600.total_angle_raw, as5600.position_rad, as5600.velocity_rad_per_sec, as5600.velocity_rpm);
       HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
 
-      HAL_Delay(100); // 每100ms输出一次数据
+      HAL_Delay(100); // 每100ms输出一次数据*/
 
   }
   /* USER CODE END 3 */
@@ -553,21 +565,25 @@ void SystemClock_Config(void)
   }
 }
 
-
+/* USER CODE BEGIN 4 */
 // 定时器中断回调
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM2) {
         if (as5600_dma_complete) {
             // 处理上一次读取的数据
             AS5600_ProcessData(&as5600);
-            
             // 启动新的读取
             as5600_dma_complete = 0;
             HAL_I2C_Mem_Read_DMA(&hi2c1, (AS5600_ADDR << 1), AS5600_ANGLE_REG, I2C_MEMADD_SIZE_8BIT, as5600_dma_buffer, 2);
         }
     }
+    if (htim->Instance == TIM3)
+    {
+        velocityOpenloop(5.0f);
+    }
 }
-/* USER CODE BEGIN 4 */
+
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if(huart->Instance == USART3) {
