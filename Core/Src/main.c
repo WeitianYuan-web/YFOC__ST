@@ -18,7 +18,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
+#include "i2c.h"
 #include "tim.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -102,6 +105,18 @@
 
 /* USER CODE BEGIN PV */
 
+//标识符
+volatile uint8_t uart_data_ready = 0;
+
+
+uint8_t uart_rx_buffer[4];  // 修改为4字节（32位浮点数大小）
+uint8_t uart_rx_length = 0; // 新增变量，记录UART接收到的有效数据长度
+char uart_buffer[100];
+
+uint32_t  time_start = 0;
+uint32_t  time_end = 0;
+uint32_t  time_diff = 0;
+
 //开环控制用
 uint32_t lastTime_open = 0;
 float angle_open = 0.0f;
@@ -128,6 +143,19 @@ const int sine_array[200] = {0, 79, 158, 237, 316, 395, 473, 552, 631, 710, 789,
                              10000, 10000};
 
 
+
+typedef struct {
+    I2C_HandleTypeDef *hi2c;
+    int32_t full_rotations;        // 完整旋转圈数
+    int32_t vel_full_rotations;    // 速度计算用的圈数
+    uint16_t angle_prev;           // 上一次角度值(0-4095)
+    uint32_t angle_prev_ts;        // 上一次角度时间戳
+    uint16_t vel_angle_prev;       // 速度计算用的上一次角度
+    uint32_t vel_angle_prev_ts;    // 速度计算用的时间戳
+    int32_t filtered_vel;           //
+    int32_t debug_raw_vel;          // 调试用的原始速度
+} AS5600_TypeDef;
+AS5600_TypeDef as5600;
 
 /* USER CODE END PV */
 
@@ -272,6 +300,38 @@ float velocityOpenloop(float target_velocity) {
   lastTime_open = now_ms;
   return Uq;
 }
+
+
+uint16_t AS5600_GetRawAngle(AS5600_TypeDef *as5600)
+{
+    uint8_t data[2];
+    uint16_t raw_angle = 0;
+
+    // 读取角度寄存器 (0x0C和0x0D)
+    HAL_I2C_Mem_Read(as5600->hi2c, (AS5600_ADDR << 1), 0x0C, I2C_MEMADD_SIZE_8BIT, data, 2, HAL_MAX_DELAY);
+
+    // 组合两个字节，高字节在前，低字节在后
+    raw_angle = ((uint16_t)data[0] << 8) | data[1];
+
+    // AS5600是12位分辨率，所以我们只保留低12位
+    raw_angle &= 0x0FFF;
+
+    return raw_angle;
+}
+void AS5600_Init(AS5600_TypeDef *as5600, I2C_HandleTypeDef *hi2c) {
+    as5600->hi2c = hi2c;
+    as5600->full_rotations = 0;
+    as5600->vel_full_rotations = 0;
+
+    // 读取初始角度
+    as5600->angle_prev = AS5600_GetRawAngle(as5600);
+    as5600->angle_prev_ts = HAL_GetTick();
+
+    HAL_Delay(1);
+
+    as5600->vel_angle_prev = AS5600_GetRawAngle(as5600);
+    as5600->vel_angle_prev_ts = HAL_GetTick();
+}
 /* USER CODE END 0 */
 
 /**
@@ -303,9 +363,13 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM1_Init();
+  MX_USART3_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
+    AS5600_Init(&as5600, &hi2c1);
     //初始化PWM
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
@@ -323,9 +387,23 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+      uint16_t raw_angle = 0;
+      time_start = HAL_GetTick();
+      for (int i = 0; i < 10000; i++)
+      {
+          //raw_angle = AS5600_GetRawAngle(&as5600);
+          velocityOpenloop(20.0f);
+      }
 
+      time_end = HAL_GetTick();
+      time_diff = time_end - time_start;
 
-      velocityOpenloop(20.0f);
+      sprintf(uart_buffer, "SVPWMandAS5600_CTIME_10000_MS: %ld\r\n", time_diff);
+      HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+
+      sprintf(uart_buffer, "raw_angle: %ld\r\n", raw_angle);
+      HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+
   }
   /* USER CODE END 3 */
 }
@@ -370,7 +448,16 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if(huart->Instance == USART3) {
+        // 设置标志，表示数据已准备好，在主循环中处理
+        uart_data_ready = 1;
 
+        // 立即重新启动UART接收
+        HAL_UART_Receive_IT(&huart3, uart_rx_buffer, 4);
+    }
+}
 /* USER CODE END 4 */
 
 /**
