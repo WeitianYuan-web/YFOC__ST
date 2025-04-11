@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "can.h"
 #include "dma.h"
 #include "i2c.h"
 #include "tim.h"
@@ -108,6 +109,19 @@
 
 //标识符
 volatile uint8_t uart_data_ready = 0;
+volatile uint8_t can_data_ready = 0;
+volatile uint8_t can_send_flag = 0;
+/* CAN发送状态标志 */
+volatile uint8_t can_tx_busy = 0;
+//CAN
+// 添加全局变量
+CAN_TxHeaderTypeDef tx_header;
+CAN_RxHeaderTypeDef rx_header;
+uint8_t can_tx_data[8];
+uint8_t can_rx_data[8];
+uint8_t can_data_buffer[8];
+uint8_t can_data_len = 0;
+uint32_t can_rx_id = 0;
 
 float dt_foc = 0.0005f;
 float dt_encode = 0.00025f;
@@ -157,7 +171,8 @@ typedef enum {
     OPENLOOP_MODE = 0,    // 开环控制
     SPEEDCLOSE_MODE = 1,       // 速度闭环
     POSITION_RELATIVE_MODE = 2,   //单圈闭环
-    POSITION_ABSOLUTE_MODE = 3    //多圈闭环
+    POSITION_ABSOLUTE_MODE = 3,   //多圈闭环
+    STOP_MODE = 4
 } control_mode_t;
 
 // PID 结构体
@@ -220,6 +235,22 @@ typedef struct {
 } AS5600_TypeDef;
 
 AS5600_TypeDef as5600;
+
+
+typedef struct {
+    uint16_t relative_position;  // 相对位置,以原始值表示 (1圈 = 4096个单位)
+    int32_t total_degrees;       // 总共旋转的角度,以原始值表示 (1圈 = 4096个单位)
+    int16_t turn_count;          // 圈数
+    int16_t speed;                 // 转速 (RPM)
+    int16_t current;               // 电流(A)
+    uint8_t temperature;          // 电机温度 (°C)
+    uint8_t mode;                 // 控制模式
+} motor_control_t;
+
+
+
+static motor_control_t motor_ctrl = {0};
+static motor_control_t motor_info = {0};
 
 /* USER CODE END PV */
 
@@ -393,9 +424,6 @@ float velocityOpenloop(float target_velocity) {
 
     if (Ts <= 0 || Ts > 0.5f) Ts = 1e-3f;
 
-    // 处理方向
-    int direction = (target_velocity >= 0) ? 1 : -1;
-    float abs_speed = fabsf(target_velocity);
 
     // 更新角度
     angle_open = _normalizeAngle(angle_open - target_velocity * Ts);
@@ -468,16 +496,21 @@ void FOC_Control(controller_t *ctrl, float dt) {
                 foc_forward(0, SPEED_DIRECTION * q_current, elec_angle);
             }
             break;
+    case STOP_MODE:
+        default:
+        {
+            foc_forward(0.0f, 0.0f, 0.0f);
+        }
     }
 }
 
 // 初始化控制器参数
 void Controller_Init(controller_t *ctrl) {
     // 设置默认控制模式
-    ctrl->mode = POSITION_RELATIVE_MODE;
+    ctrl->mode = POSITION_ABSOLUTE_MODE;
     
     // 位置PID参数初始化
-    ctrl->pid.basic.position.Kp = 0.8f;   // 比例系数
+    ctrl->pid.basic.position.Kp = 1.2f;   // 比例系数
     ctrl->pid.basic.position.Ki = 0.01f;   // 积分系数
     ctrl->pid.basic.position.Kd = 0.001f;  // 微分系数
     ctrl->pid.basic.position.integral = 0.0f;
@@ -613,9 +646,81 @@ void AS5600_ProcessData(AS5600_TypeDef *as5600) {
         );
     }
     
-    // 更新上一次的角度和时间戳
+    // 更新上一次的角度
     as5600->angle_prev = raw_angle;
 }
+
+/**
+ * @brief  发送电机反馈信息
+ * @retval 无
+ */
+void send_motor_feedback(void)
+{
+  // 准备数据
+  uint8_t data[8];
+  uint32_t mailbox;
+
+  // 配置CAN发送头
+  tx_header.StdId = FEEDBACK_ID_BASE;  // 使用0x111作为标识符
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.IDE = CAN_ID_STD;
+  tx_header.DLC = 8;  // 数据长度为8字节
+  // 按照指定格式打包数据
+  data[0] = (motor_info.total_degrees >> 24) & 0xFF;  // 最高字节
+  data[1] = (motor_info.total_degrees >> 16) & 0xFF;  // 次高字节
+  data[2] = (motor_info.total_degrees >> 8) & 0xFF;   // 次低字节
+  data[3] = motor_info.total_degrees & 0xFF;          // 最低字节
+  data[4] = (motor_info.speed >> 8) & 0xFF;
+  data[5] = motor_info.speed & 0xFF;
+  data[6] = (motor_info.current >> 8) & 0xFF;
+  data[7] = motor_info.current & 0xFF;
+
+  // 发送CAN消息
+  HAL_CAN_AddTxMessage(&hcan, &tx_header, data, &mailbox);
+  // 调试输出
+  /*char startup_msg[] = "QUEUE MOTOR FEEDBACK\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)startup_msg, strlen(startup_msg), 100);*/
+}
+
+/**
+ * @brief  发送电机信息
+ * @retval 无
+ */
+void send_motor_info(void)
+{
+  // 准备数据
+  uint8_t data[8] = {0};
+  uint32_t mailbox;
+
+  // 配置CAN发送头
+  tx_header.StdId = INFOMATION_ID_BASE;  // 使用0x121作为标识符
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.IDE = CAN_ID_STD;
+  tx_header.DLC = 8;  // 数据长度为8字节
+  // 按照指定格式打包数据
+  data[0] = motor_info.temperature;
+  data[1] = motor_info.mode;
+
+  HAL_CAN_AddTxMessage(&hcan, &tx_header, data, &mailbox);
+  // 调试输出
+  /*char startup_msg[] = "QUEUE MOTOR INFO\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t*)startup_msg, strlen(startup_msg), 100);*/
+}
+
+void set_motor_info()
+{
+  // 获取角度信息
+  motor_info.relative_position = as5600.raw_angle;
+  motor_info.total_degrees = as5600.total_angle_raw;
+
+  // 单独计算速度，避免递归调用
+  motor_info.speed = _round(as5600.velocity_rpm);
+
+  motor_info.current = -100; //-100表示不使用电流环
+  motor_info.temperature = 0;//0表示没有温度传感器
+  motor_info.mode = ctrl.mode;
+};
+
 /* USER CODE END 0 */
 
 /**
@@ -653,7 +758,36 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_CAN_Init();
   /* USER CODE BEGIN 2 */
+
+    /* 初始化CAN头结构体 */
+    tx_header.StdId = 0x100;
+    tx_header.RTR = CAN_RTR_DATA;
+    tx_header.IDE = CAN_ID_STD;
+    tx_header.DLC = 8;
+    tx_header.TransmitGlobalTime = DISABLE;
+
+
+    // CAN过滤器配置
+    CAN_FilterTypeDef can_filter = {
+        .FilterIdHigh = 0x0000,
+        .FilterIdLow = 0x0000,
+        .FilterMaskIdHigh = 0x0000,
+        .FilterMaskIdLow = 0x0000,
+        .FilterFIFOAssignment = CAN_FILTER_FIFO0,
+        .FilterBank = 0,
+        .FilterMode = CAN_FILTERMODE_IDMASK,
+        .FilterScale = CAN_FILTERSCALE_32BIT,
+        .FilterActivation = ENABLE,
+        .SlaveStartFilterBank = 14
+    };
+    HAL_CAN_ConfigFilter(&hcan, &can_filter);
+
+    /* 启动CAN接收 */
+    HAL_CAN_Start(&hcan);
+    HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+
 
     AS5600_Init(&as5600, &hi2c1);
     AS5600_StartDMAReading();
@@ -690,8 +824,20 @@ int main(void)
                ctrl.target_position,as5600.total_angle_raw, ctrl.sensor.position_rad, as5600.velocity_rad_per_sec_filtered, as5600.velocity_rpm);
        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
 
-       HAL_Delay(100); // 每100ms输出一次数据
-
+      set_motor_info();
+      send_motor_feedback();
+      send_motor_info();
+      /* 处理CAN接收数据 */
+      if (can_data_ready) {
+          motor_ctrl.total_degrees = can_data_buffer[0] << 24 | can_data_buffer[1] << 16| can_data_buffer[2] << 8 | can_data_buffer[3];
+          motor_ctrl.speed = (int16_t)(can_data_buffer[4] << 8 | can_data_buffer[5]);
+          motor_ctrl.mode = can_data_buffer[6];
+          can_data_ready = 0;
+      }
+      ctrl.target_position = (float)motor_ctrl.total_degrees * _2PI / 4096.0f;
+      ctrl.mode = motor_ctrl.mode;
+      ctrl.target_velocity = (float)motor_ctrl.speed * _2PI / 60;
+      HAL_Delay(20); // 每20ms输出一次数据
   }
   /* USER CODE END 3 */
 }
@@ -767,6 +913,20 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
         // 立即重新启动UART接收
         HAL_UART_Receive_IT(&huart3, uart_rx_buffer, 4);
+    }
+}
+
+/* CAN接收回调函数修改 */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    /* 接收CAN消息 */
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, can_rx_data) == HAL_OK)
+    {
+        // 简单复制数据，避免在中断中做太多处理
+        can_rx_id = rx_header.StdId;
+        can_data_len = rx_header.DLC;
+        memcpy(can_data_buffer, can_rx_data, can_data_len);
+        can_data_ready = 1;
     }
 }
 /* USER CODE END 4 */
