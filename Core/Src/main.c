@@ -76,6 +76,7 @@
 
 #define POLE_PAIRS 7 // 极对数
 #define DIRECTION_FORWARD (-1)
+#define SPEED_DIRECTION (-1)
 // 电路参数：
 #define R_SHUNT 0.02           // 电流采样电阻，欧姆
 #define OP_GAIN 50             // 运放放大倍数
@@ -172,6 +173,7 @@ typedef struct {
     float position_rad;     // 位置（弧度）
     float velocity_rad;     // 速度（rad/s）
     float mech_angle_rad;   // 机械角度单圈()
+    float rotor_zero_angle_rad;
 } sensor_data_t;
 
 
@@ -430,10 +432,10 @@ void FOC_Control(controller_t *ctrl, float dt) {
                 float velocity_error = ctrl->target_velocity - ctrl->sensor.velocity_rad;
                 
                 // 速度PID控制器计算
-                //q_current = PID_Calculate(&ctrl->pid.basic.velocity, velocity_error, dt);
+                q_current = PID_Calculate(&ctrl->pid.basic.velocity, velocity_error, dt) + ctrl->filter.k_ff * velocity_error;
 
                 // 应用FOC控制
-                foc_forward(0, velocity_error * 0.1f, elec_angle);
+                foc_forward(0, SPEED_DIRECTION * q_current, elec_angle);
             }
             break;
             
@@ -443,13 +445,13 @@ void FOC_Control(controller_t *ctrl, float dt) {
                 // 计算位置误差（考虑单圈）
                 float position_error = ctrl->target_position - ctrl->sensor.position_rad;
                 //position_error = atan2(_sin(position_error), _cos(position_error));
-                position_error = - cycle_diff(position_error, _2PI);
+                position_error = cycle_diff(position_error, _2PI);
 
                 // 位置PID计算
                 q_current = PID_Calculate(&ctrl->pid.basic.position, position_error, dt);
 
                 // 应用FOC控制
-                foc_forward(0, q_current, elec_angle);
+                foc_forward(0, SPEED_DIRECTION * q_current, elec_angle);
             }
             break;
             
@@ -457,13 +459,13 @@ void FOC_Control(controller_t *ctrl, float dt) {
             // 位置闭环控制（多圈）
             {
                 // 计算位置误差（考虑多圈）
-                float position_error = -(ctrl->target_position - ctrl->sensor.position_rad);
+                float position_error = (ctrl->target_position - ctrl->sensor.position_rad);
 
                 // 位置PID计算
                 q_current = PID_Calculate(&ctrl->pid.basic.position, position_error, dt);
 
                 // 应用FOC控制
-                foc_forward(0, q_current, elec_angle);
+                foc_forward(0, SPEED_DIRECTION * q_current, elec_angle);
             }
             break;
     }
@@ -472,7 +474,7 @@ void FOC_Control(controller_t *ctrl, float dt) {
 // 初始化控制器参数
 void Controller_Init(controller_t *ctrl) {
     // 设置默认控制模式
-    ctrl->mode = SPEEDCLOSE_MODE;
+    ctrl->mode = POSITION_RELATIVE_MODE;
     
     // 位置PID参数初始化
     ctrl->pid.basic.position.Kp = 0.8f;   // 比例系数
@@ -482,14 +484,14 @@ void Controller_Init(controller_t *ctrl) {
     ctrl->pid.basic.position.prev_error = 0.0f;
     
     // 速度PID参数初始化
-    ctrl->pid.basic.velocity.Kp = 0.01f;   // 比例系数
-    ctrl->pid.basic.velocity.Ki = 0.0f;   // 积分系数
-    ctrl->pid.basic.velocity.Kd = 0.0f;   // 微分系数
+    ctrl->pid.basic.velocity.Kp = 0.18f;   // 比例系数
+    ctrl->pid.basic.velocity.Ki = 0.1f;   // 积分系数
+    ctrl->pid.basic.velocity.Kd = 0.0007f;   // 微分系数
     ctrl->pid.basic.velocity.integral = 0.0f;
     ctrl->pid.basic.velocity.prev_error = 0.0f;
     
     // 前馈系数
-    ctrl->filter.k_ff = 0.0f;  // 默认不使用前馈
+    ctrl->filter.k_ff = 0.05f;  // 默认不使用前馈
     
     // 目标设置初始化
     ctrl->target_position = 0.0f;
@@ -664,8 +666,11 @@ int main(void)
     HAL_Delay(10);
     set_pwm_duty(0.5, 0, 0);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
     HAL_Delay(500);                       // 保持一会，转子吸引过来需要时间
-    as5600.rotor_zero_angle_rad = as5600.position_rad ;
+    as5600.rotor_zero_angle_rad =  _electricalAngle(as5600.position_rad,  POLE_PAIRS ) ;
+
     Controller_Init(&ctrl);
+    ctrl.target_position = as5600.position_rad;
+
     set_pwm_duty(0, 0, 0);                // 松开电机
     HAL_Delay(50);
 
@@ -745,9 +750,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM3)
     {
        // 更新传感器数据到控制器
-         ctrl.sensor.position_rad = as5600.rotor_phy_angle;
+         ctrl.sensor.position_rad = as5600.position_rad;
          ctrl.sensor.velocity_rad = as5600.velocity_rad_per_sec_filtered;
-
+         ctrl.sensor.rotor_zero_angle_rad = as5600.rotor_zero_angle_rad;
          // 执行FOC控制
          FOC_Control(&ctrl, dt_foc);
     }
