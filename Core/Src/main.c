@@ -75,7 +75,7 @@
 #define _PI_6 0.52359877559f
 
 #define POLE_PAIRS 7 // 极对数
-
+#define DIRECTION_FORWARD (-1)
 // 电路参数：
 #define R_SHUNT 0.02           // 电流采样电阻，欧姆
 #define OP_GAIN 50             // 运放放大倍数
@@ -108,6 +108,8 @@
 //标识符
 volatile uint8_t uart_data_ready = 0;
 
+float dt_foc = 0.0005f;
+float dt_encode = 0.00025f;
 
 uint8_t uart_rx_buffer[4];  // 修改为4字节（32位浮点数大小）
 uint8_t uart_rx_length = 0; // 新增变量，记录UART接收到的有效数据长度
@@ -150,12 +152,50 @@ uint8_t as5600_reg_addr = AS5600_ANGLE_REG; // 角度寄存器地址
 volatile uint8_t as5600_dma_complete = 0; // DMA完成标志
 
 //foc_runing
+typedef enum {
+    OPENLOOP_MODE = 0,    // 开环控制
+    SPEEDCLOSE_MODE = 1,       // 速度闭环
+    POSITION_RELATIVE_MODE = 2,   //单圈闭环
+    POSITION_ABSOLUTE_MODE = 3    //多圈闭环
+} control_mode_t;
+
+// PID 结构体
+typedef struct {
+    float Kp;           // 比例系数
+    float Ki;           // 积分系数
+    float Kd;           // 微分系数
+    float integral;     // 积分项
+    float prev_error;   // 上一次误差
+} pid_params_t;
+
+typedef struct {
+    float position_rad;     // 位置（弧度）
+    float velocity_rad;     // 速度（rad/s）
+    float mech_angle_rad;   // 机械角度单圈()
+} sensor_data_t;
 
 
-// 用于存储角度和速度的变量
-float position_rad = 0.0f; // 当前位置（弧度）
-float velocity_rad_per_sec = 0.0f; // 当前速度（弧度/秒）
-float velocity_rpm = 0.0f; // 当前速度（RPM）
+typedef struct {
+    struct {
+        struct {
+            pid_params_t position;    // 位置环 PID
+            pid_params_t velocity;    // 速度环 PID
+        } basic;
+    } pid;
+
+    struct {
+        float k_ff;     // 前馈系数
+    } filter;
+
+    sensor_data_t sensor;    // 传感器数据
+    control_mode_t mode;     // 控制模式
+
+    float zero_electric_angle ;    // 电机零电角
+    float target_position;   // 目标位置
+    float target_velocity;   // 目标速度
+} controller_t;
+
+static controller_t ctrl;
 
 
 // AS5600结构体 
@@ -165,14 +205,16 @@ typedef struct {
     int32_t vel_full_rotations;    // 速度计算用的圈数
     uint16_t raw_angle;            // 当前原始角度值(0-4095)
     int32_t total_angle_raw;       // 总共旋转的角度-一圈是4096
-    float rotor_zero_elec_angle;        // 零电角度
+    float rotor_zero_angle_rad;    // 零角度
+    int16_t rotor_zero_angle_raw;  //
     uint16_t angle_prev;           // 上一次角度值(0-4095)
-    uint32_t angle_prev_ts;        // 上一次角度时间戳
     float position_rad;            // 当前位置（弧度）
+    float rotor_phy_angle;
     float velocity_rad_per_sec;    // 当前速度（弧度/秒）
     float velocity_rpm;            // 当前速度（RPM）
     float velocity_rad_per_sec_filtered; // 滤波后的速度（弧度/秒）
     float velocity_rpm_filtered;   // 滤波后的速度（RPM）
+    int8_t once;
 } AS5600_TypeDef;
 
 AS5600_TypeDef as5600;
@@ -221,6 +263,23 @@ float _cos(float a)
     return _sin(a_sin);
 }
 
+float cycle_diff(float diff, float cycle)
+{
+    // 参数校验
+    const float eps = 1e-6f;
+    if (cycle <= 0.0f || isnan(cycle)) {
+        return NAN;  // 或返回原值/抛出错误
+    }
+
+    // 计算半周期并调整
+    const float half_cycle = cycle / 2.0f;
+    if (diff > half_cycle + eps) {
+        diff -= cycle;
+    } else if (diff < -half_cycle - eps) {
+        diff += cycle;
+    }
+    return diff;
+}
 
 // normalizing radian angle to [0,2PI]
 float _normalizeAngle(float angle)
@@ -232,7 +291,7 @@ float _normalizeAngle(float angle)
 // Electrical angle calculation
 float _electricalAngle(float shaft_angle, int pole_pairs)
 {
-    return (shaft_angle * (float)pole_pairs) - as5600.rotor_zero_elec_angle;
+    return DIRECTION_FORWARD * (shaft_angle * (float)pole_pairs);
 }
 
 // square root approximation function using
@@ -257,6 +316,26 @@ float low_pass_filter(float input, float last_output, float alpha)
     return alpha * input + (1.0f - alpha) * last_output;
 }
 
+float PID_Calculate(pid_params_t *pid, float error, float dt) {
+    // 比例项
+    float p_term = pid->Kp * error;
+    
+    // 积分项（带积分限幅）
+    pid->integral += error * dt;
+    pid->integral = _constrain(pid->integral, -100.0f, 100.0f); // 积分限幅，防止积分饱和
+    float i_term = pid->Ki * pid->integral;
+    
+    // 微分项
+    float derivative = (error - pid->prev_error) / dt;
+    float d_term = pid->Kd * derivative;
+    
+    // 保存当前误差
+    pid->prev_error = error;
+    
+    // 计算PID输出（带输出限幅）
+    float output = p_term + i_term + d_term;
+    return output;
+}
 void set_pwm_duty(float d_u, float d_v, float d_w)
 {
   d_u = min(d_u, 0.9);
@@ -305,30 +384,118 @@ void foc_forward(float d, float q, float rotor_rad)
     set_pwm_duty(d_u, d_v, d_w);
 }
 
+
 float velocityOpenloop(float target_velocity) {
-  uint32_t now_ms = HAL_GetTick();
-  float Ts = (now_ms - lastTime_open) * 1e-3f; // 转换为秒
+    uint32_t now_ms = HAL_GetTick();
+    float Ts = (now_ms - lastTime_open) * 1e-3f; // 转换为秒
 
-  if (Ts <= 0 || Ts > 0.5f) Ts = 1e-3f;
+    if (Ts <= 0 || Ts > 0.5f) Ts = 1e-3f;
 
-  // 处理方向
-  int direction = (target_velocity >= 0) ? 1 : -1;
-  float abs_speed = fabsf(target_velocity);
+    // 处理方向
+    int direction = (target_velocity >= 0) ? 1 : -1;
+    float abs_speed = fabsf(target_velocity);
 
-  // 更新角度
-  angle_open = _normalizeAngle(angle_open - target_velocity * Ts);
+    // 更新角度
+    angle_open = _normalizeAngle(angle_open - target_velocity * Ts);
 
-  float Uq = voltage_power_supply/3;
+    float Uq = voltage_power_supply/3;
 
 
-    foc_forward(0, 0.5f, angle_open);
-  lastTime_open = now_ms;
-  return Uq;
+    foc_forward(0, 1.0f, angle_open);
+    lastTime_open = now_ms;
+    return Uq;
 }
 
-void position_control(float rad)
-{
+// FOC主控制函数
+void FOC_Control(controller_t *ctrl, float dt) {
+
+    
+    // 计算电角度
+    float elec_angle = _electricalAngle(ctrl->sensor.position_rad, POLE_PAIRS);
+    elec_angle = _normalizeAngle(elec_angle);
+    // 控制电流输出
+    float q_current = 0.0f; // q轴电流（转矩电流）
+    
+    // 根据不同控制模式执行对应控制算法
+    switch (ctrl->mode) {
+        case OPENLOOP_MODE:
+            // 开环控制模式，直接使用目标速度计算角度
+            velocityOpenloop(ctrl->target_velocity);
+            break;
+            
+        case SPEEDCLOSE_MODE:
+            // 速度闭环控制
+            {
+                // 计算速度误差
+                float velocity_error = ctrl->target_velocity - ctrl->sensor.velocity_rad;
+                
+                // 速度PID控制器计算
+                //q_current = PID_Calculate(&ctrl->pid.basic.velocity, velocity_error, dt);
+
+                // 应用FOC控制
+                foc_forward(0, velocity_error * 0.1f, elec_angle);
+            }
+            break;
+            
+        case POSITION_RELATIVE_MODE:
+            // 位置闭环控制（单圈）
+            {
+                // 计算位置误差（考虑单圈）
+                float position_error = ctrl->target_position - ctrl->sensor.position_rad;
+                //position_error = atan2(_sin(position_error), _cos(position_error));
+                position_error = - cycle_diff(position_error, _2PI);
+
+                // 位置PID计算
+                q_current = PID_Calculate(&ctrl->pid.basic.position, position_error, dt);
+
+                // 应用FOC控制
+                foc_forward(0, q_current, elec_angle);
+            }
+            break;
+            
+        case POSITION_ABSOLUTE_MODE:
+            // 位置闭环控制（多圈）
+            {
+                // 计算位置误差（考虑多圈）
+                float position_error = -(ctrl->target_position - ctrl->sensor.position_rad);
+
+                // 位置PID计算
+                q_current = PID_Calculate(&ctrl->pid.basic.position, position_error, dt);
+
+                // 应用FOC控制
+                foc_forward(0, q_current, elec_angle);
+            }
+            break;
+    }
 }
+
+// 初始化控制器参数
+void Controller_Init(controller_t *ctrl) {
+    // 设置默认控制模式
+    ctrl->mode = SPEEDCLOSE_MODE;
+    
+    // 位置PID参数初始化
+    ctrl->pid.basic.position.Kp = 0.8f;   // 比例系数
+    ctrl->pid.basic.position.Ki = 0.01f;   // 积分系数
+    ctrl->pid.basic.position.Kd = 0.001f;  // 微分系数
+    ctrl->pid.basic.position.integral = 0.0f;
+    ctrl->pid.basic.position.prev_error = 0.0f;
+    
+    // 速度PID参数初始化
+    ctrl->pid.basic.velocity.Kp = 0.01f;   // 比例系数
+    ctrl->pid.basic.velocity.Ki = 0.0f;   // 积分系数
+    ctrl->pid.basic.velocity.Kd = 0.0f;   // 微分系数
+    ctrl->pid.basic.velocity.integral = 0.0f;
+    ctrl->pid.basic.velocity.prev_error = 0.0f;
+    
+    // 前馈系数
+    ctrl->filter.k_ff = 0.0f;  // 默认不使用前馈
+    
+    // 目标设置初始化
+    ctrl->target_position = 0.0f;
+    ctrl->target_velocity = 20.0f;
+}
+
 
 uint16_t AS5600_GetRawAngle(AS5600_TypeDef *as5600)
 {
@@ -352,8 +519,11 @@ void AS5600_Init(AS5600_TypeDef *as5600, I2C_HandleTypeDef *hi2c) {
     as5600->vel_full_rotations = 0;
     as5600->raw_angle = 0;
     as5600->position_rad = 0.0f;
+    as5600->rotor_zero_angle_rad = 0.0f;
+    as5600->rotor_phy_angle = 0.0f;
     as5600->velocity_rad_per_sec = 0.0f;
     as5600->velocity_rpm = 0.0f;
+    as5600->once = 0;
 
     // 读取初始角度
     uint8_t data[2];
@@ -362,7 +532,6 @@ void AS5600_Init(AS5600_TypeDef *as5600, I2C_HandleTypeDef *hi2c) {
     // 组合两个字节，高字节在前，低字节在后
     as5600->raw_angle = ((uint16_t)data[0] << 8) | data[1];
     as5600->angle_prev = as5600->raw_angle & 0x0FFF; // 12位分辨率
-    as5600->angle_prev_ts = HAL_GetTick();
 }
 // 启动连续DMA读取
 void AS5600_StartDMAReading(void) {
@@ -384,12 +553,7 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
 
 // 计算角度和速度
 void AS5600_ProcessData(AS5600_TypeDef *as5600) {
-    // 获取当前时间戳
-    uint32_t now = HAL_GetTick();
-    float dt = (float)(now - as5600->angle_prev_ts) / 1000.0f; // 转换为秒
-    
-    if (dt <= 0.0f) dt = 0.001f; // 防止除零
-    
+
     // 解析收到的角度数据
     uint16_t raw_angle = ((uint16_t)as5600_dma_buffer[0] << 8) | as5600_dma_buffer[1];
     raw_angle &= 0x0FFF; // 保留12位数据
@@ -411,43 +575,44 @@ void AS5600_ProcessData(AS5600_TypeDef *as5600) {
     
     // 转换为弧度
     as5600->position_rad = (float)as5600->total_angle_raw * _2PI / 4096.0f;
-    
+    as5600->rotor_phy_angle = as5600->position_rad - as5600->rotor_zero_angle_rad;
+
     // 计算角速度
     float angle_diff_rad = (float)angle_diff * _2PI / 4096.0f;
     if (angle_diff < -2048) angle_diff_rad += _2PI;
     else if (angle_diff > 2048) angle_diff_rad -= _2PI;
     
     // 原始速度计算
-    float velocity_rad_per_sec_raw = angle_diff_rad / dt;
+    float velocity_rad_per_sec_raw = angle_diff_rad / dt_encode;
     as5600->velocity_rad_per_sec = velocity_rad_per_sec_raw;
     as5600->velocity_rpm = velocity_rad_per_sec_raw * 60.0f / _2PI;
     
     // 应用低通滤波 - 选择合适的滤波系数
-    float alpha = 0.2f; // 滤波系数，值越小滤波效果越强，但响应越慢
+    float alpha = 0.005f; // 滤波系数，值越小滤波效果越强，但响应越慢
 
     // 首次运行时初始化滤波值
-    if (as5600->angle_prev_ts == 0) {
+    if (as5600->once == 0) {
         as5600->velocity_rad_per_sec_filtered = velocity_rad_per_sec_raw;
         as5600->velocity_rpm_filtered = as5600->velocity_rpm;
+        as5600->once = 1;
     } else {
         // 对弧度/秒速度应用滤波
         as5600->velocity_rad_per_sec_filtered = low_pass_filter(
-            velocity_rad_per_sec_raw, 
-            as5600->velocity_rad_per_sec_filtered, 
+            velocity_rad_per_sec_raw,
+            as5600->velocity_rad_per_sec_filtered,
             alpha
         );
-        
+
         // 对RPM速度应用滤波
         as5600->velocity_rpm_filtered = low_pass_filter(
-            as5600->velocity_rpm, 
-            as5600->velocity_rpm_filtered, 
+            as5600->velocity_rpm,
+            as5600->velocity_rpm_filtered,
             alpha
         );
     }
     
     // 更新上一次的角度和时间戳
     as5600->angle_prev = raw_angle;
-    as5600->angle_prev_ts = now;
 }
 /* USER CODE END 0 */
 
@@ -496,12 +661,14 @@ int main(void)
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
     /* 使能输出 */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
-
-    set_pwm_duty(0.5, 0, 0);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
-    HAL_Delay(400);                       // 保持一会，转子吸引过来需要时间
-    as5600.rotor_zero_elec_angle = _electricalAngle(as5600.position_rad, POLE_PAIRS) ;
-    set_pwm_duty(0, 0, 0);                // 松开电机
     HAL_Delay(10);
+    set_pwm_duty(0.5, 0, 0);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
+    HAL_Delay(500);                       // 保持一会，转子吸引过来需要时间
+    as5600.rotor_zero_angle_rad = as5600.position_rad ;
+    Controller_Init(&ctrl);
+    set_pwm_duty(0, 0, 0);                // 松开电机
+    HAL_Delay(50);
+
     // 启动定时器
     HAL_TIM_Base_Start_IT(&htim3);
   /* USER CODE END 2 */
@@ -513,14 +680,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-   
+       // 可以在此处添加一些非实时处理代码，比如UART发送数据
+       sprintf(uart_buffer, "target_position:%.2f total_encode:%ld 总rad:%.2f rad 速度:%.2f rad/s %.2f RPM\r\n",
+               ctrl.target_position,as5600.total_angle_raw, ctrl.sensor.position_rad, as5600.velocity_rad_per_sec_filtered, as5600.velocity_rpm);
+       HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
 
-      /*// 可以在此处添加一些非实时处理代码，比如UART发送数据
-      sprintf(uart_buffer, "角度encode:%d total_encode:%ld 总rad:%.2f rad 速度:%.2f rad/s %.2f RPM\r\n",
-              as5600.raw_angle,as5600.total_angle_raw, as5600.position_rad, as5600.velocity_rad_per_sec, as5600.velocity_rpm);
-      HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
-
-      HAL_Delay(100); // 每100ms输出一次数据*/
+       HAL_Delay(100); // 每100ms输出一次数据
 
   }
   /* USER CODE END 3 */
@@ -579,7 +744,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     }
     if (htim->Instance == TIM3)
     {
-        velocityOpenloop(5.0f);
+       // 更新传感器数据到控制器
+         ctrl.sensor.position_rad = as5600.rotor_phy_angle;
+         ctrl.sensor.velocity_rad = as5600.velocity_rad_per_sec_filtered;
+
+         // 执行FOC控制
+         FOC_Control(&ctrl, dt_foc);
     }
 }
 
