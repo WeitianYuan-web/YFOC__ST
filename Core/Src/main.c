@@ -188,7 +188,7 @@ typedef struct {
     float position_rad;     // 位置（弧度）
     float velocity_rad;     // 速度（rad/s）
     float mech_angle_rad;   // 机械角度单圈()
-    float rotor_zero_angle_rad;
+    float zero_elec_angle_rad;
 } sensor_data_t;
 
 
@@ -222,7 +222,6 @@ typedef struct {
     int32_t vel_full_rotations;    // 速度计算用的圈数
     uint16_t raw_angle;            // 当前原始角度值(0-4095)
     int32_t total_angle_raw;       // 总共旋转的角度-一圈是4096
-    float rotor_zero_angle_rad;    // 零角度
     int16_t rotor_zero_angle_raw;  //
     uint16_t angle_prev;           // 上一次角度值(0-4095)
     float position_rad;            // 当前位置（弧度）
@@ -324,7 +323,7 @@ float _normalizeAngle(float angle)
 // Electrical angle calculation
 float _electricalAngle(float shaft_angle, int pole_pairs)
 {
-    return DIRECTION_FORWARD * (shaft_angle * (float)pole_pairs);
+    return DIRECTION_FORWARD * (shaft_angle * (float)pole_pairs) - ctrl.sensor.zero_elec_angle_rad;
 }
 
 // square root approximation function using
@@ -468,11 +467,10 @@ void FOC_Control(controller_t *ctrl, float dt) {
             break;
             
         case POSITION_RELATIVE_MODE:
-            // 位置闭环控制（单圈）
+            // 位置闭环控制（单圈）--------单圈控制有问题，需要实现的是固定到一个单圈角度
             {
                 // 计算位置误差（考虑单圈）
                 float position_error = ctrl->target_position - ctrl->sensor.position_rad;
-                //position_error = atan2(_sin(position_error), _cos(position_error));
                 position_error = cycle_diff(position_error, _2PI);
 
                 // 位置PID计算
@@ -554,7 +552,6 @@ void AS5600_Init(AS5600_TypeDef *as5600, I2C_HandleTypeDef *hi2c) {
     as5600->vel_full_rotations = 0;
     as5600->raw_angle = 0;
     as5600->position_rad = 0.0f;
-    as5600->rotor_zero_angle_rad = 0.0f;
     as5600->rotor_phy_angle = 0.0f;
     as5600->velocity_rad_per_sec = 0.0f;
     as5600->velocity_rpm = 0.0f;
@@ -610,7 +607,7 @@ void AS5600_ProcessData(AS5600_TypeDef *as5600) {
     
     // 转换为弧度
     as5600->position_rad = (float)as5600->total_angle_raw * _2PI / 4096.0f;
-    as5600->rotor_phy_angle = as5600->position_rad - as5600->rotor_zero_angle_rad;
+    as5600->rotor_phy_angle = as5600->position_rad;
 
     // 计算角速度
     float angle_diff_rad = (float)angle_diff * _2PI / 4096.0f;
@@ -798,14 +795,14 @@ int main(void)
     /* 使能输出 */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
     HAL_Delay(10);
-    set_pwm_duty(0.5, 0, 0);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
+    foc_forward(0.0f, 0.5f, _3PI_2);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
     HAL_Delay(500);                       // 保持一会，转子吸引过来需要时间
-    as5600.rotor_zero_angle_rad =  _electricalAngle(as5600.position_rad,  POLE_PAIRS ) ;
+    ctrl.sensor.zero_elec_angle_rad =  _electricalAngle(as5600.position_rad,  POLE_PAIRS ) ;
 
     Controller_Init(&ctrl);
     ctrl.target_position = as5600.position_rad;
 
-    set_pwm_duty(0, 0, 0);                // 松开电机
+    foc_forward(0.0f, 0.0f, 0.0f);                 // 松开电机
     HAL_Delay(50);
 
     // 启动定时器
@@ -833,10 +830,10 @@ int main(void)
           motor_ctrl.speed = (int16_t)(can_data_buffer[4] << 8 | can_data_buffer[5]);
           motor_ctrl.mode = can_data_buffer[6];
           can_data_ready = 0;
+          ctrl.target_position = (float)motor_ctrl.total_degrees * _2PI / 4096.0f;
+          ctrl.mode = motor_ctrl.mode;
+          ctrl.target_velocity = (float)motor_ctrl.speed * _2PI / 60;
       }
-      ctrl.target_position = (float)motor_ctrl.total_degrees * _2PI / 4096.0f;
-      ctrl.mode = motor_ctrl.mode;
-      ctrl.target_velocity = (float)motor_ctrl.speed * _2PI / 60;
       HAL_Delay(20); // 每20ms输出一次数据
   }
   /* USER CODE END 3 */
@@ -898,7 +895,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
        // 更新传感器数据到控制器
          ctrl.sensor.position_rad = as5600.position_rad;
          ctrl.sensor.velocity_rad = as5600.velocity_rad_per_sec_filtered;
-         ctrl.sensor.rotor_zero_angle_rad = as5600.rotor_zero_angle_rad;
          // 执行FOC控制
          FOC_Control(&ctrl, dt_foc);
     }
