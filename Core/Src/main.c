@@ -172,7 +172,8 @@ typedef enum {
     SPEEDCLOSE_MODE = 1,       // 速度闭环
     POSITION_RELATIVE_MODE = 2,   //单圈闭环
     POSITION_ABSOLUTE_MODE = 3,   //多圈闭环
-    STOP_MODE = 4
+    POSITION_SPEEDCLOSE_MODE = 4, //位置速度串级闭环
+    STOP_MODE = 5
 } control_mode_t;
 
 // PID 结构体
@@ -198,6 +199,10 @@ typedef struct {
             pid_params_t position;    // 位置环 PID
             pid_params_t velocity;    // 速度环 PID
         } basic;
+        struct {
+            pid_params_t position;    // 串级控制位置环 PID
+            pid_params_t velocity;    // 串级控制速度环 PID
+        } cascade;
     } pid;
 
     struct {
@@ -494,11 +499,31 @@ void FOC_Control(controller_t *ctrl, float dt) {
                 foc_forward(0, SPEED_DIRECTION * q_current, elec_angle);
             }
             break;
-    case STOP_MODE:
-        default:
-        {
-            foc_forward(0.0f, 0.0f, 0.0f);
-        }
+        case POSITION_SPEEDCLOSE_MODE:
+            // 位置速度串级闭环控制
+            {
+                // 计算位置误差（考虑多圈）
+                float position_error = (ctrl->target_position - ctrl->sensor.position_rad);
+                
+                // 位置环PID计算，输出速度目标值
+                float target_velocity = PID_Calculate(&ctrl->pid.cascade.position, position_error, dt);
+
+                target_velocity = _constrain(target_velocity, -ctrl->target_velocity, ctrl->target_velocity);
+                // 计算速度误差
+                float velocity_error = target_velocity - ctrl->sensor.velocity_rad;
+                
+                // 速度环PID计算，输出电流目标值
+                q_current = PID_Calculate(&ctrl->pid.cascade.velocity, velocity_error, dt);
+                
+                // 应用FOC控制
+                foc_forward(0, SPEED_DIRECTION * q_current, elec_angle);
+            }
+            break;
+        case STOP_MODE:
+            default:
+            {
+                foc_forward(0.0f, 0.0f, 0.0f);
+            }
     }
 }
 
@@ -521,6 +546,20 @@ void Controller_Init(controller_t *ctrl) {
     ctrl->pid.basic.velocity.integral = 0.0f;
     ctrl->pid.basic.velocity.prev_error = 0.0f;
     
+    // 串级控制位置PID参数初始化
+    ctrl->pid.cascade.position.Kp = 3.2f;   // 比例系数（外环通常较小）
+    ctrl->pid.cascade.position.Ki = 0.03f;  // 积分系数
+    ctrl->pid.cascade.position.Kd = 0.0002f;  // 微分系数
+    ctrl->pid.cascade.position.integral = 0.0f;
+    ctrl->pid.cascade.position.prev_error = 0.0f;
+    
+    // 串级控制速度PID参数初始化
+    ctrl->pid.cascade.velocity.Kp = 0.15f;  // 比例系数（内环响应要快）
+    ctrl->pid.cascade.velocity.Ki = 0.08f;  // 积分系数
+    ctrl->pid.cascade.velocity.Kd = 0.0005f; // 微分系数
+    ctrl->pid.cascade.velocity.integral = 0.0f;
+    ctrl->pid.cascade.velocity.prev_error = 0.0f;
+    
     // 前馈系数
     ctrl->filter.k_ff = 0.05f;  // 默认不使用前馈
     
@@ -529,6 +568,35 @@ void Controller_Init(controller_t *ctrl) {
     ctrl->target_velocity = 20.0f;
 }
 
+// PID参数调整函数
+void Controller_SetCascadePID(controller_t *ctrl, 
+                             float pos_kp, float pos_ki, float pos_kd,
+                             float vel_kp, float vel_ki, float vel_kd) {
+    // 更新串级位置PID参数
+    ctrl->pid.cascade.position.Kp = pos_kp;
+    ctrl->pid.cascade.position.Ki = pos_ki;
+    ctrl->pid.cascade.position.Kd = pos_kd;
+    
+    // 更新串级速度PID参数  
+    ctrl->pid.cascade.velocity.Kp = vel_kp;
+    ctrl->pid.cascade.velocity.Ki = vel_ki;
+    ctrl->pid.cascade.velocity.Kd = vel_kd;
+}
+
+// 重置PID积分项函数（模式切换时使用）
+void Controller_ResetPID(controller_t *ctrl) {
+    // 重置基础PID积分项
+    ctrl->pid.basic.position.integral = 0.0f;
+    ctrl->pid.basic.position.prev_error = 0.0f;
+    ctrl->pid.basic.velocity.integral = 0.0f;
+    ctrl->pid.basic.velocity.prev_error = 0.0f;
+    
+    // 重置串级PID积分项
+    ctrl->pid.cascade.position.integral = 0.0f;
+    ctrl->pid.cascade.position.prev_error = 0.0f;
+    ctrl->pid.cascade.velocity.integral = 0.0f;
+    ctrl->pid.cascade.velocity.prev_error = 0.0f;
+}
 
 uint16_t AS5600_GetRawAngle(AS5600_TypeDef *as5600)
 {
@@ -766,11 +834,12 @@ int main(void)
     tx_header.TransmitGlobalTime = DISABLE;
 
 
-    // CAN过滤器配置
+    // CAN过滤器配置 - 只接收ID为0x101的消息
     CAN_FilterTypeDef can_filter = {
-        .FilterIdHigh = 0x0000,
+        // 对于标准ID，需要将11位ID左移5位放到FilterIdHigh的高11位
+        .FilterIdHigh = (CONTROL_ID_1_4 << 5),     // 0x101左移5位
         .FilterIdLow = 0x0000,
-        .FilterMaskIdHigh = 0x0000,
+        .FilterMaskIdHigh = (0x7FF << 5),          // 标准ID掩码：11位全1左移5位
         .FilterMaskIdLow = 0x0000,
         .FilterFIFOAssignment = CAN_FILTER_FIFO0,
         .FilterBank = 0,
@@ -785,6 +854,10 @@ int main(void)
     HAL_CAN_Start(&hcan);
     HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
 
+    // 调试输出：CAN初始化完成信息
+    char can_init_msg[80];
+    sprintf(can_init_msg, "CAN initialized - Filter set to accept only ID: 0x%03X\r\n", CONTROL_ID_1_4);
+    HAL_UART_Transmit(&huart3, (uint8_t*)can_init_msg, strlen(can_init_msg), 100);
 
     AS5600_Init(&as5600, &hi2c1);
     AS5600_StartDMAReading();
@@ -817,8 +890,20 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
        // 可以在此处添加一些非实时处理代码，比如UART发送数据
-       sprintf(uart_buffer, "target_position:%.2f total_encode:%ld 总rad:%.2f rad 速度:%.2f rad/s %.2f RPM\r\n",
-               ctrl.target_position,as5600.total_angle_raw, ctrl.sensor.position_rad, as5600.velocity_rad_per_sec_filtered, as5600.velocity_rpm);
+       char mode_str[20];
+       switch(ctrl.mode) {
+           case OPENLOOP_MODE: strcpy(mode_str, "OPENLOOP"); break;
+           case SPEEDCLOSE_MODE: strcpy(mode_str, "SPEEDCLOSE"); break;
+           case POSITION_RELATIVE_MODE: strcpy(mode_str, "POS_RELATIVE"); break;
+           case POSITION_ABSOLUTE_MODE: strcpy(mode_str, "POS_ABSOLUTE"); break;
+           case POSITION_SPEEDCLOSE_MODE: strcpy(mode_str, "POS_SPEEDCLOSE"); break;
+           case STOP_MODE: strcpy(mode_str, "STOP"); break;
+           default: strcpy(mode_str, "UNKNOWN"); break;
+       }
+       
+       sprintf(uart_buffer, "Mode:%s target_pos:%.2f total_encode:%ld pos_rad:%.2f vel:%.2f rad/s %.2f RPM\r\n",
+               mode_str, ctrl.target_position, as5600.total_angle_raw, ctrl.sensor.position_rad, 
+               as5600.velocity_rad_per_sec_filtered, as5600.velocity_rpm);
        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
 
       set_motor_info();
@@ -826,13 +911,33 @@ int main(void)
       send_motor_info();
       /* 处理CAN接收数据 */
       if (can_data_ready) {
-          motor_ctrl.total_degrees = can_data_buffer[0] << 24 | can_data_buffer[1] << 16| can_data_buffer[2] << 8 | can_data_buffer[3];
-          motor_ctrl.speed = (int16_t)(can_data_buffer[4] << 8 | can_data_buffer[5]);
-          motor_ctrl.mode = can_data_buffer[6];
-          can_data_ready = 0;
-          ctrl.target_position = (float)motor_ctrl.total_degrees * _2PI / 4096.0f;
-          ctrl.mode = motor_ctrl.mode;
-          ctrl.target_velocity = (float)motor_ctrl.speed * _2PI / 60;
+          // 额外检查：确保处理的是控制命令ID (0x101)
+          if (can_rx_id == CONTROL_ID_1_4) {
+              motor_ctrl.total_degrees = can_data_buffer[0] << 24 | can_data_buffer[1] << 16| can_data_buffer[2] << 8 | can_data_buffer[3];
+              motor_ctrl.speed = (int16_t)(can_data_buffer[4] << 8 | can_data_buffer[5]);
+              motor_ctrl.mode = can_data_buffer[6];
+              can_data_ready = 0;
+              
+              // 检查模式是否发生变化，如果变化则重置PID
+              static control_mode_t previous_mode = STOP_MODE;
+              if (motor_ctrl.mode != previous_mode) {
+                  Controller_ResetPID(&ctrl);
+                  previous_mode = motor_ctrl.mode;
+              }
+              
+              ctrl.target_position = (float)motor_ctrl.total_degrees * _2PI / 4096.0f;
+              ctrl.mode = motor_ctrl.mode;
+              ctrl.target_velocity = (float)motor_ctrl.speed * _2PI / 60;
+              
+              // 调试输出：显示接收到的CAN控制命令
+              char can_debug_msg[100];
+              sprintf(can_debug_msg, "CAN RX: ID=0x%03X, degrees=%ld, speed=%d, mode=%d\r\n", 
+                      can_rx_id, motor_ctrl.total_degrees, motor_ctrl.speed, motor_ctrl.mode);
+              HAL_UART_Transmit(&huart3, (uint8_t*)can_debug_msg, strlen(can_debug_msg), 100);
+          } else {
+              // 如果不是控制命令ID，清除标志但不处理数据
+              can_data_ready = 0;
+          }
       }
       HAL_Delay(20); // 每20ms输出一次数据
   }
@@ -918,11 +1023,15 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     /* 接收CAN消息 */
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, can_rx_data) == HAL_OK)
     {
-        // 简单复制数据，避免在中断中做太多处理
-        can_rx_id = rx_header.StdId;
-        can_data_len = rx_header.DLC;
-        memcpy(can_data_buffer, can_rx_data, can_data_len);
-        can_data_ready = 1;
+        // 检查接收到的消息ID是否为控制命令ID (0x101)
+        if (rx_header.StdId == CONTROL_ID_1_4) {
+            // 简单复制数据，避免在中断中做太多处理
+            can_rx_id = rx_header.StdId;
+            can_data_len = rx_header.DLC;
+            memcpy(can_data_buffer, can_rx_data, can_data_len);
+            can_data_ready = 1;
+        }
+        // 如果不是0x101的消息，则忽略
     }
 }
 /* USER CODE END 4 */
