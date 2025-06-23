@@ -48,6 +48,14 @@
 #define AS5600_ANGLE_REG  0x0C    // 角度寄存器地址
 #define _2PI              6.28318530718f
 
+// 按键和LED控制相关定义
+#define BUTTON_PIN           GPIO_PIN_3
+#define BUTTON_PORT          GPIOA
+#define LED_PIN              GPIO_PIN_13
+#define LED_PORT             GPIOC
+#define BUTTON_DEBOUNCE_TIME 50    // 按键防抖时间(ms)
+#define LED_BASE_PERIOD      1000   // LED基础闪烁周期(ms)
+
 //FOC.C
 #define deg2rad(a) (_PI * (a) / 180)
 #define rad2deg(a) (180 * (a) / PI)
@@ -113,6 +121,15 @@ volatile uint8_t can_data_ready = 0;
 volatile uint8_t can_send_flag = 0;
 /* CAN发送状态标志 */
 volatile uint8_t can_tx_busy = 0;
+
+// 按键和LED控制相关变量
+volatile uint8_t current_id = 2;              // 当前ID (1-4)
+volatile uint32_t button_last_press_time = 0; // 上次按键按下时间
+volatile uint8_t button_state = 0;            // 当前按键状态
+volatile uint8_t button_pressed = 0;          // 按键按下标志
+volatile uint32_t led_last_toggle_time = 0;   // LED上次切换时间
+volatile uint8_t led_state = 0;               // LED当前状态
+
 //CAN
 // 添加全局变量
 CAN_TxHeaderTypeDef tx_header;
@@ -547,8 +564,8 @@ void Controller_Init(controller_t *ctrl) {
     ctrl->pid.basic.velocity.prev_error = 0.0f;
     
     // 串级控制位置PID参数初始化
-    ctrl->pid.cascade.position.Kp = 3.2f;   // 比例系数（外环通常较小）
-    ctrl->pid.cascade.position.Ki = 0.03f;  // 积分系数
+    ctrl->pid.cascade.position.Kp = 15.2f;   // 比例系数（外环通常较小）
+    ctrl->pid.cascade.position.Ki = 0.2f;  // 积分系数
     ctrl->pid.cascade.position.Kd = 0.0002f;  // 微分系数
     ctrl->pid.cascade.position.integral = 0.0f;
     ctrl->pid.cascade.position.prev_error = 0.0f;
@@ -715,6 +732,46 @@ void AS5600_ProcessData(AS5600_TypeDef *as5600) {
     as5600->angle_prev = raw_angle;
 }
 
+// 获取当前CAN控制ID
+uint32_t get_current_control_id(void) {
+    return CONTROL_ID_1_4 + (current_id - 1);
+}
+
+// 获取当前CAN反馈ID
+uint32_t get_current_feedback_id(void) {
+    return FEEDBACK_ID_BASE + (current_id - 1);
+}
+
+// 获取当前CAN信息ID
+uint32_t get_current_info_id(void) {
+    return INFOMATION_ID_BASE + (current_id - 1);
+}
+
+// 重新配置CAN过滤器
+void reconfigure_can_filter(void) {
+    // 停止CAN
+    HAL_CAN_Stop(&hcan);
+
+    // 重新配置过滤器以接收当前ID的控制命令
+    CAN_FilterTypeDef can_filter = {
+        .FilterIdHigh = (get_current_control_id() << 5),     // 当前ID左移5位
+        .FilterIdLow = 0x0000,
+        .FilterMaskIdHigh = (0x7FF << 5),          // 标准ID掩码：11位全1左移5位
+        .FilterMaskIdLow = 0x0000,
+        .FilterFIFOAssignment = CAN_FILTER_FIFO0,
+        .FilterBank = 0,
+        .FilterMode = CAN_FILTERMODE_IDMASK,
+        .FilterScale = CAN_FILTERSCALE_32BIT,
+        .FilterActivation = ENABLE,
+        .SlaveStartFilterBank = 14
+    };
+    HAL_CAN_ConfigFilter(&hcan, &can_filter);
+
+    // 重新启动CAN
+    HAL_CAN_Start(&hcan);
+    HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+}
+
 /**
  * @brief  发送电机反馈信息
  * @retval 无
@@ -725,8 +782,8 @@ void send_motor_feedback(void)
   uint8_t data[8];
   uint32_t mailbox;
 
-  // 配置CAN发送头
-  tx_header.StdId = FEEDBACK_ID_BASE;  // 使用0x111作为标识符
+  // 配置CAN发送头 - 使用动态ID
+  tx_header.StdId = get_current_feedback_id();  // 根据当前ID选择反馈ID
   tx_header.RTR = CAN_RTR_DATA;
   tx_header.IDE = CAN_ID_STD;
   tx_header.DLC = 8;  // 数据长度为8字节
@@ -757,8 +814,8 @@ void send_motor_info(void)
   uint8_t data[8] = {0};
   uint32_t mailbox;
 
-  // 配置CAN发送头
-  tx_header.StdId = INFOMATION_ID_BASE;  // 使用0x121作为标识符
+  // 配置CAN发送头 - 使用动态ID
+  tx_header.StdId = get_current_info_id();  // 根据当前ID选择信息ID
   tx_header.RTR = CAN_RTR_DATA;
   tx_header.IDE = CAN_ID_STD;
   tx_header.DLC = 8;  // 数据长度为8字节
@@ -785,6 +842,70 @@ void set_motor_info()
   motor_info.temperature = 0;//0表示没有温度传感器
   motor_info.mode = ctrl.mode;
 };
+
+// 按键检测函数
+void button_scan(void) {
+    uint32_t current_time = HAL_GetTick();
+    uint8_t button_read = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN);
+    
+    // 按键按下检测（假设按键按下为低电平）
+    if (button_read == GPIO_PIN_RESET && button_state == 0) {
+        if (current_time - button_last_press_time > BUTTON_DEBOUNCE_TIME) {
+            button_state = 1;
+            button_pressed = 1;
+            button_last_press_time = current_time;
+        }
+    }
+    // 按键释放检测
+    else if (button_read == GPIO_PIN_SET && button_state == 1) {
+        if (current_time - button_last_press_time > BUTTON_DEBOUNCE_TIME) {
+            button_state = 0;
+        }
+    }
+}
+
+// 处理按键按下事件
+void handle_button_press(void) {
+    if (button_pressed) {
+        button_pressed = 0;
+        
+        // ID循环：1 -> 2 -> 3 -> 4 -> 1
+        current_id++;
+        if (current_id > 4) {
+            current_id = 1;
+        }
+        
+        // 重新配置CAN过滤器以接收新的ID
+        reconfigure_can_filter();
+        
+        // 调试输出
+        char debug_msg[50];
+        sprintf(debug_msg, "ID changed to: %d (CAN ID: 0x%03X)\r\n", 
+                current_id, get_current_control_id());
+        HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
+    }
+}
+
+// LED控制函数 - 根据ID以不同频率闪烁
+void led_control(void) {
+    uint32_t current_time = HAL_GetTick();
+    uint32_t led_period;
+    
+    // 根据ID设置不同的闪烁频率
+    // ID1: 200ms周期 (1Hz)
+    // ID2: 400ms周期 (2Hz)
+    // ID3: 600ms周期 (3Hz)
+    // ID4: 800ms周期 (4Hz)
+    led_period = LED_BASE_PERIOD / current_id;
+    
+    if (current_time - led_last_toggle_time >= led_period) {
+        led_state = !led_state;
+        HAL_GPIO_WritePin(LED_PORT, LED_PIN, led_state ? GPIO_PIN_RESET : GPIO_PIN_SET);
+        led_last_toggle_time = current_time;
+    }
+}
+
+
 
 /* USER CODE END 0 */
 
@@ -834,10 +955,10 @@ int main(void)
     tx_header.TransmitGlobalTime = DISABLE;
 
 
-    // CAN过滤器配置 - 只接收ID为0x101的消息
+    // CAN过滤器配置 - 根据当前ID配置过滤器
     CAN_FilterTypeDef can_filter = {
         // 对于标准ID，需要将11位ID左移5位放到FilterIdHigh的高11位
-        .FilterIdHigh = (CONTROL_ID_1_4 << 5),     // 0x101左移5位
+        .FilterIdHigh = (get_current_control_id() << 5),     // 当前控制ID左移5位
         .FilterIdLow = 0x0000,
         .FilterMaskIdHigh = (0x7FF << 5),          // 标准ID掩码：11位全1左移5位
         .FilterMaskIdLow = 0x0000,
@@ -856,7 +977,8 @@ int main(void)
 
     // 调试输出：CAN初始化完成信息
     char can_init_msg[80];
-    sprintf(can_init_msg, "CAN initialized - Filter set to accept only ID: 0x%03X\r\n", CONTROL_ID_1_4);
+    sprintf(can_init_msg, "CAN initialized - Current ID: %d, Filter: 0x%03X\r\n", 
+            current_id, get_current_control_id());
     HAL_UART_Transmit(&huart3, (uint8_t*)can_init_msg, strlen(can_init_msg), 100);
 
     AS5600_Init(&as5600, &hi2c1);
@@ -867,13 +989,13 @@ int main(void)
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
     /* 使能输出 */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(10);
-    foc_forward(0.0f, 0.5f, _3PI_2);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
-    HAL_Delay(500);                       // 保持一会，转子吸引过来需要时间
-    ctrl.sensor.zero_elec_angle_rad =  _electricalAngle(as5600.position_rad,  POLE_PAIRS ) ;
-
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
     Controller_Init(&ctrl);
     ctrl.target_position = as5600.position_rad;
+    HAL_Delay(100);
+    foc_forward(0.0f, 0.5f, _3PI_2);              // 生成SVPWM模型中的基础矢量1，即对应转子零度位置
+    HAL_Delay(2000);                       // 保持一会，转子吸引过来需要时间
+    ctrl.sensor.zero_elec_angle_rad =  _electricalAngle(as5600.position_rad,  POLE_PAIRS ) ;
 
     foc_forward(0.0f, 0.0f, 0.0f);                 // 松开电机
     HAL_Delay(50);
@@ -889,6 +1011,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+       // 按键扫描和LED控制
+       button_scan();
+       handle_button_press();
+       led_control();
+       
        // 可以在此处添加一些非实时处理代码，比如UART发送数据
        char mode_str[20];
        switch(ctrl.mode) {
@@ -911,8 +1038,8 @@ int main(void)
       send_motor_info();
       /* 处理CAN接收数据 */
       if (can_data_ready) {
-          // 额外检查：确保处理的是控制命令ID (0x101)
-          if (can_rx_id == CONTROL_ID_1_4) {
+          // 额外检查：确保处理的是当前设备的控制命令ID
+          if (can_rx_id == get_current_control_id()) {
               motor_ctrl.total_degrees = can_data_buffer[0] << 24 | can_data_buffer[1] << 16| can_data_buffer[2] << 8 | can_data_buffer[3];
               motor_ctrl.speed = (int16_t)(can_data_buffer[4] << 8 | can_data_buffer[5]);
               motor_ctrl.mode = can_data_buffer[6];
@@ -1023,15 +1150,15 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     /* 接收CAN消息 */
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, can_rx_data) == HAL_OK)
     {
-        // 检查接收到的消息ID是否为控制命令ID (0x101)
-        if (rx_header.StdId == CONTROL_ID_1_4) {
+        // 检查接收到的消息ID是否为当前设备的控制命令ID
+        if (rx_header.StdId == get_current_control_id()) {
             // 简单复制数据，避免在中断中做太多处理
             can_rx_id = rx_header.StdId;
             can_data_len = rx_header.DLC;
             memcpy(can_data_buffer, can_rx_data, can_data_len);
             can_data_ready = 1;
         }
-        // 如果不是0x101的消息，则忽略
+        // 如果不是当前设备的控制命令ID，则忽略
     }
 }
 /* USER CODE END 4 */
