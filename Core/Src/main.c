@@ -990,6 +990,7 @@ int main(void)
     /* 使能输出 */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    HAL_Delay(500);
     Controller_Init(&ctrl);
     ctrl.target_position = as5600.position_rad;
     HAL_Delay(100);
